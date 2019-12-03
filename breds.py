@@ -18,8 +18,8 @@ __author__ = "David S. Batista"
 __email__ = "dsbatista@inesc-id.pt"
 
 # useful for debugging
-PRINT_TUPLES = False
-PRINT_PATTERNS = False
+PRINT_TUPLES = True
+PRINT_PATTERNS = True
 
 
 class BREDS(object):
@@ -126,14 +126,32 @@ class BREDS(object):
         count_matches = dict()
         for t in self.processed_tuples:
             for s in self.config.positive_seed_tuples:
-                if t.e1 == s.e1 and t.e2 == s.e2:
-                    matched_tuples.append(t)
-                    try:
-                        count_matches[(t.e1, t.e2)] += 1
-                    except KeyError:
-                        count_matches[(t.e1, t.e2)] = 1
+                if t.e1 != s.e1 or t.e2 != s.e2:
+                    continue
 
-        return count_matches, matched_tuples
+                matched_tuples.append(t)
+                try:
+                    count_matches[(t.e1, t.e2)] += 1
+                except KeyError:
+                    count_matches[(t.e1, t.e2)] = 1
+
+        # print match result
+        if len(matched_tuples) == 0:
+            print("\nNo seed matches found")
+            sys.exit(0)
+
+        print("\nNumber of seed matches found")
+        sorted_counts = sorted(
+            list(count_matches.items()),
+            key=operator.itemgetter(1),
+            reverse=True
+        )
+        for t in sorted_counts:
+            print(t[0][0], '\t', t[0][1], t[1])
+
+        print("\n", len(matched_tuples), "tuples matched")
+
+        return matched_tuples
 
     def write_relationships_to_disk(self):
         print("\nWriting extracted relationships to disk")
@@ -152,16 +170,10 @@ class BREDS(object):
             f_output.write("\n")
         f_output.close()
 
-    def init_bootstrap(self, tuples):
+    def init_bootstrap(self, sentences_file):
 
         # starts a bootstrap iteration
-
-        if tuples is not None:
-            f = open(tuples, "r")
-            print("\nLoading processed tuples from disk...")
-            self.processed_tuples = pickle.load(f)
-            f.close()
-            print(len(self.processed_tuples), "tuples loaded")
+        self.generate_tuples(sentences_file)
 
         self.curr_iteration = 0
         while self.curr_iteration <= self.config.number_iterations:
@@ -172,160 +184,160 @@ class BREDS(object):
                 print(s.e1, '\t', s.e2)
 
             # Looks for sentences matching the seed instances
-            count_matches, matched_tuples = self.match_seeds_tuples()
+            matched_tuples = self.match_seeds_tuples()
+            self.generate_extraction_patterns(matched_tuples)
+            self.find_relationship_instances()
+            self.handle_semantic_drift()
 
-            if len(matched_tuples) == 0:
-                print("\nNo seed matches found")
-                sys.exit(0)
-
-            else:
-                print("\nNumber of seed matches found")
-                sorted_counts = sorted(
-                    list(count_matches.items()),
-                    key=operator.itemgetter(1),
-                    reverse=True
-                )
-                for t in sorted_counts:
-                    print(t[0][0], '\t', t[0][1], t[1])
-
-                print("\n", len(matched_tuples), "tuples matched")
-
-                # Cluster the matched instances, to generate
-                # patterns/update patterns
-                print("\nClustering matched instances to generate patterns")
-                self.cluster_tuples(matched_tuples)
-
-                # Eliminate patterns supported by less than
-                # 'min_pattern_support' tuples
-                new_patterns = [p for p in self.patterns if len(p.tuples) >
-                                self.config.min_pattern_support]
-                self.patterns = new_patterns
-
-                print("\n", len(self.patterns), "patterns generated")
-
-                if PRINT_PATTERNS is True:
-                    count = 1
-                    print("\nPatterns:")
-                    for p in self.patterns:
-                        print(count)
-                        for t in p.tuples:
-                            print("BEF", t.bef_words)
-                            print("BET", t.bet_words)
-                            print("AFT", t.aft_words)
-                            print("========")
-                            print("\n")
-                        count += 1
-
-                if self.curr_iteration == 0 and len(self.patterns) == 0:
-                    print("No patterns generated")
-                    sys.exit(0)
-
-                # Look for sentences with occurrence of seeds
-                # semantic types (e.g., ORG - LOC)
-                # This was already collect and its stored in:
-                # self.processed_tuples
-                #
-                # Measure the similarity of each occurrence with each
-                # extraction pattern and store each pattern that has a
-                # similarity higher than a given threshold
-                #
-                # Each candidate tuple will then have a number of patterns
-                # that extracted it each with an associated degree of match.
-                print("Number of tuples to be analyzed:", len(self.processed_tuples))
-
-                print("\nCollecting instances based on extraction patterns")
-                count = 0
-
-                for t in self.processed_tuples:
-
-                    count += 1
-                    if count % 1000 == 0:
-                        sys.stdout.write(".")
-                        sys.stdout.flush()
-
-                    sim_best = 0
-                    for extraction_pattern in self.patterns:
-                        accept, score = self.similarity_all(
-                            t, extraction_pattern
-                        )
-                        if accept is True:
-                            extraction_pattern.update_selectivity(
-                                t, self.config
-                            )
-                            if score > sim_best:
-                                sim_best = score
-                                pattern_best = extraction_pattern
-
-                    if sim_best >= self.config.threshold_similarity:
-                        # if this tuple was already extracted, check if this
-                        # extraction pattern is already associated with it,
-                        # if not, associate this pattern with it and store the
-                        # similarity score
-                        patterns = self.candidate_tuples[t]
-                        if patterns is not None:
-                            if pattern_best not in [x[0] for x in patterns]:
-                                self.candidate_tuples[t].append(
-                                    (pattern_best, sim_best)
-                                )
-
-                        # If this tuple was not extracted before
-                        # associate this pattern with the instance
-                        # and the similarity score
-                        else:
-                            self.candidate_tuples[t].append(
-                                (pattern_best, sim_best)
-                            )
-
-                # update all patterns confidence
-                for p in self.patterns:
-                    p.update_confidence(self.config)
-
-                if PRINT_PATTERNS is True:
-                    print("\nPatterns:")
-                    for p in self.patterns:
-                        for t in p.tuples:
-                            print("BEF", t.bef_words)
-                            print("BET", t.bet_words)
-                            print("AFT", t.aft_words)
-                            print("========")
-                        print("Positive", p.positive)
-                        print("Negative", p.negative)
-                        print("Unknown", p.unknown)
-                        print("Tuples", len(p.tuples))
-                        print("Pattern Confidence", p.confidence)
-                        print("\n")
-
-                # update tuple confidence based on patterns confidence
-                print("\n\nCalculating tuples confidence")
-                for t in list(self.candidate_tuples.keys()):
-                    confidence = 1
-                    t.confidence_old = t.confidence
-                    for p in self.candidate_tuples.get(t):
-                        confidence *= 1 - (p[0].confidence * p[1])
-                    t.confidence = 1 - confidence
-
-                # sort tuples by confidence and print
-                if PRINT_TUPLES is True:
-                    extracted_tuples = list(self.candidate_tuples.keys())
-                    tuples_sorted = sorted(extracted_tuples, key=lambda tpl: tpl.confidence,
-                                           reverse=True)
-                    for t in tuples_sorted:
-                        print(t.sentence)
-                        print(t.e1, t.e2)
-                        print(t.confidence)
-                        print("\n")
-
-                print("Adding tuples to seed with confidence >= {}".format(
-                    str(self.config.instance_confidence)))
-                for t in list(self.candidate_tuples.keys()):
-                    if t.confidence >= self.config.instance_confidence:
-                        seed = Seed(t.e1, t.e2)
-                        self.config.positive_seed_tuples.add(seed)
-
-                # increment the number of iterations
-                self.curr_iteration += 1
+            # increment the number of iterations
+            self.curr_iteration += 1
 
         self.write_relationships_to_disk()
+
+    def find_seed_matches(self):
+        pass
+
+    # Cluster the matched instances, to generate
+    # patterns/update patterns
+    def generate_extraction_patterns(self, matched_tuples):
+        print("\nClustering matched instances to generate patterns")
+        self.cluster_tuples(matched_tuples)
+
+        # Eliminate patterns supported by less than
+        # 'min_pattern_support' tuples
+        new_patterns = [p for p in self.patterns if len(p.tuples) >
+                        self.config.min_pattern_support]
+        self.patterns = new_patterns
+
+        print("\n", len(self.patterns), "patterns generated")
+
+        self.print_pattern1()
+
+        if self.curr_iteration == 0 and len(self.patterns) == 0:
+            print("No patterns generated")
+            sys.exit(0)
+
+    # Look for sentences with occurrence of seeds
+    # semantic types (e.g., ORG - LOC)
+    # This was already collect and its stored in:
+    # self.processed_tuples
+    #
+    # Measure the similarity of each occurrence with each
+    # extraction pattern and store each pattern that has a
+    # similarity higher than a given threshold
+    #
+    # Each candidate tuple will then have a number of patterns
+    # that extracted it each with an associated degree of match.
+    def find_relationship_instances(self):
+        print("Number of tuples to be analyzed:", len(self.processed_tuples))
+
+        print("\nCollecting instances based on extraction patterns")
+        count = 0
+
+        for t in self.processed_tuples:
+
+            count += 1
+            if count % 1000 == 0:
+                sys.stdout.write(".")
+                sys.stdout.flush()
+
+            sim_best = 0
+            for extraction_pattern in self.patterns:
+                accept, score = self.similarity_all(t, extraction_pattern)
+
+                if accept is True:
+                    extraction_pattern.update_selectivity(t, self.config)
+                if score > sim_best:
+                    sim_best = score
+                    pattern_best = extraction_pattern
+
+            if sim_best >= self.config.threshold_similarity:
+                # if this tuple was already extracted, check if this
+                # extraction pattern is already associated with it,
+                # if not, associate this pattern with it and store the
+                # similarity score
+                patterns = self.candidate_tuples[t]
+                if patterns is not None:
+                    if pattern_best not in [x[0] for x in patterns]:
+                        self.candidate_tuples[t].append((pattern_best, sim_best))
+
+                # If this tuple was not extracted before
+                # associate this pattern with the instance
+                # and the similarity score
+                else:
+                    self.candidate_tuples[t].append((pattern_best, sim_best))
+
+
+    def handle_semantic_drift(self):
+        # update all patterns confidence
+        for p in self.patterns:
+            p.update_confidence(self.config)
+
+        self.print_pattern2()
+
+        # update tuple confidence based on patterns confidence
+        print("\n\nCalculating tuples confidence")
+        for t in list(self.candidate_tuples.keys()):
+            confidence = 1
+            t.confidence_old = t.confidence
+            for p in self.candidate_tuples.get(t):
+                confidence *= 1 - (p[0].confidence * p[1])
+            t.confidence = 1 - confidence
+
+        self.print_tuples()
+
+        print("Adding tuples to seed with confidence >= {}".format(
+             str(self.config.instance_confidence)))
+        for t in list(self.candidate_tuples.keys()):
+            if t.confidence >= self.config.instance_confidence:
+                seed = Seed(t.e1, t.e2)
+                self.config.positive_seed_tuples.add(seed)
+
+
+    def print_pattern1(self):
+        if PRINT_PATTERNS is False: return
+
+        count = 1
+        print("\nPatterns:")
+        for p in self.patterns:
+            print(count)
+            for t in p.tuples:
+                print("BEF", t.bef_words)
+                print("BET", t.bet_words)
+                print("AFT", t.aft_words)
+                print("========")
+                print("\n")
+            count += 1
+
+    def print_pattern2(self):
+        if PRINT_PATTERNS is False: return
+
+        print("\nPatterns:")
+        for p in self.patterns:
+            for t in p.tuples:
+                print("BEF", t.bef_words)
+                print("BET", t.bet_words)
+                print("AFT", t.aft_words)
+                print("========")
+            print("Positive", p.positive)
+            print("Negative", p.negative)
+            print("Unknown", p.unknown)
+            print("Tuples", len(p.tuples))
+            print("Pattern Confidence", p.confidence)
+            print("\n")
+
+    # sort tuples by confidence and print
+    def print_tuples(self):
+        if PRINT_TUPLES is False: return
+
+        extracted_tuples = list(self.candidate_tuples.keys())
+        tuples_sorted = sorted(extracted_tuples, key=lambda tpl: tpl.confidence,
+                                           reverse=True)
+        for t in tuples_sorted:
+            print(t.sentence)
+            print(t.e1, t.e2)
+            print(t.confidence)
+            print("\n")
 
     def cluster_tuples(self, matched_tuples):
         # this is a single-pass clustering
@@ -378,13 +390,8 @@ def main():
         confidence = float(sys.argv[6])
 
         breads = BREDS(configuration, seeds_file, negative_seeds, similarity, confidence)
+        breads.init_bootstrap(sentences_file)
 
-        if sentences_file.endswith('.pkl'):
-            print("Loading pre-processed sentences", sentences_file)
-            breads.init_bootstrap(tuples=sentences_file)
-        else:
-            breads.generate_tuples(sentences_file)
-            breads.init_bootstrap(tuples=None)
 
 if __name__ == "__main__":
     main()
