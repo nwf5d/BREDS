@@ -72,8 +72,8 @@ class Relationship:
         self.e2_type = e2_type
 
     def __eq__(self, other):
-        if self.e1 == other.e1 and self.before == other.before and \
-                        self.between == other.between \
+        if self.e1 == other.e1 and self.e2 == other.e2 and \
+                self.before == other.before and self.between == other.between \
                 and self.after == other.after:
             return True
         else:
@@ -90,117 +90,132 @@ class Sentence:
                  window_size, pos_tagger=None, config=None):
         self.relationships = list()
         self.tagged_text = None
+        self.max_tokens = max_tokens
+        self.min_tokens = min_tokens
+        self.window_size = window_size
+        self.pos_tagger = pos_tagger
+        self.config = config
+        self.e1_type = e1_type
+        self.e2_type = e2_type
 
         # determine which type of regex to use according to
         # how named-entities are tagged
-        entities_regex = None
-        if config.tag_type == "simple":
-            entities_regex = config.regex_simple
-        elif config.tag_type == "linked":
-            entities_regex = config.regex_linked
+        entities_regexs = {
+            "simple": config.regex_simple,
+            "linked": config.regex_linked
+            }
+        clean_regexs = {
+            "simple": config.regex_clean_simple,
+            "clean": config.regex_clean_linked
+            }
+        entities_regex = entities_regexs.get(config.tag_type)
+        clean_regex = clean_regexs.get(config.tag_type)
 
         # find named-entities
         entities = []
         for m in re.finditer(entities_regex, sentence):
             entities.append(m)
 
-        if len(entities) >= 2:
-            # clean tags from text
-            sentence_no_tags = None
+        if len(entities) < 2: return
+
+        # clean tags from text
+        sentence_no_tags = re.sub(clean_regex, "", sentence)
+        text_tokens = word_tokenize(sentence_no_tags)
+
+        locations = self.extract_entities(entities, text_tokens, config)
+        self.find_pair_entities(locations, text_tokens)
+
+
+    def extract_entities(self, entities, text_tokens, config):
+        # extract information about the entity, create an Entity instance
+        # and store in a structure to hold information collected about
+        # all the entities in the sentence
+        entities_info = set()
+        type_regex = '<([A-Z]+)'
+        url_regex = 'url=([^>]+)'
+        string_regexs = {"simple": '<[A-Z]+>([^<]+)</[A-Z]+>',
+                         "linked": '<[A-Z]+ url=[^>]+>([^<]+)</[A-Z]+>'}
+
+        string_regex = string_regexs.get(config.tag_type)
+        for x in range(0, len(entities)):
+            entity = entities[x].group()
+            e_type = re.findall(type_regex, entity)[0]
+            e_string = re.findall(string_regex, entity)[0]
+            e_parts, locations = find_locations(e_string, text_tokens)
+
             if config.tag_type == "simple":
-                sentence_no_tags = re.sub(
-                    config.regex_clean_simple, "", sentence
-                )
+                e = EntitySimple(e_string, e_parts, e_type, locations)
+                entities_info.add(e)
             elif config.tag_type == "linked":
-                sentence_no_tags = re.sub(
-                    config.regex_clean_linked, "", sentence
-                )
-            text_tokens = word_tokenize(sentence_no_tags)
+                e_url = re.findall(url_regex, entity)[0]
+                e = EntityLinked(e_string, e_parts, e_type, locations, e_url)
+                entities_info.add(e)
 
-            # extract information about the entity, create an Entity instance
-            # and store in a structure to hold information collected about
-            # all the entities in the sentence
-            entities_info = set()
-            for x in range(0, len(entities)):
-                if config.tag_type == "simple":
-                    entity = entities[x].group()
-                    e_string = re.findall('<[A-Z]+>([^<]+)</[A-Z]+>', entity)[0]
-                    e_type = re.findall('<([A-Z]+)', entity)[0]
-                    e_parts, locations = find_locations(e_string, text_tokens)
-                    e = EntitySimple(e_string, e_parts, e_type, locations)
-                    entities_info.add(e)
+        # create an hash table:
+        # - key is the starting index in the tokenized sentence of an entity
+        # - value the corresponding Entity instance
+        locations = dict()
+        for e in entities_info:
+            for start in e.locations:
+                locations[start] = e
+        return locations
 
-                elif config.tag_type == "linked":
-                    entity = entities[x].group()
-                    e_url = re.findall('url=([^>]+)', entity)[0]
-                    e_string = re.findall(
-                        '<[A-Z]+ url=[^>]+>([^<]+)</[A-Z]+>', entity)[0]
-                    e_type = re.findall('<([A-Z]+)', entity)[0]
-                    e_parts, locations = find_locations(e_string, text_tokens)
-                    e = EntityLinked(
-                        e_string, e_parts, e_type, locations, e_url
-                    )
-                    entities_info.add(e)
+    def find_pair_entities(self, locations, text_tokens):
+        # look for pair of entities such that:
+        # the distance between the two entities is less than 'max_tokens'
+        # and greater than 'min_tokens'
+        # the arguments match the seeds semantic types
+        sorted_keys = list(sorted(locations))
+        for i in range(len(sorted_keys)-1):
+            e1_index = sorted_keys[i]
+            e2_index = sorted_keys[i+1]
+            distance = e2_index - e1_index
+            e1 = locations[e1_index]
+            e2 = locations[e2_index]
+            if self.max_tokens < distance or distance < self.min_tokens or e1.type != self.e1_type \
+                        or e2.type != self.e2_type:
+                continue
 
-            # create an hash table:
-            # - key is the starting index in the tokenized sentence of an entity
-            # - value the corresponding Entity instance
-            locations = dict()
-            for e in entities_info:
-                for start in e.locations:
-                    locations[start] = e
+            # ignore relationships between the same entity
+            if self.config.tag_type == "simple" and e1.string == e2.string:
+                continue
+            elif self.config.tag_type == "linked" and e1.url == e2.url:
+                continue
 
-            # look for pair of entities such that:
-            # the distance between the two entities is less than 'max_tokens'
-            # and greater than 'min_tokens'
-            # the arguments match the seeds semantic types
-            sorted_keys = list(sorted(locations))
-            for i in range(len(sorted_keys)-1):
-                distance = sorted_keys[i+1] - sorted_keys[i]
-                e1 = locations[sorted_keys[i]]
-                e2 = locations[sorted_keys[i+1]]
-                if max_tokens >= distance >= min_tokens and e1.type == e1_type \
-                        and e2.type == e2_type:
+            # run PoS-tagger over the sentence only once
+            if self.tagged_text is None:
+                # split text into tokens and tag them using NLTK's
+                # default English tagger
+                # POS_TAGGER = 'taggers/maxent_treebank_pos_tagger/
+                # english.pickle'
+                self.tagged_text = self.pos_tagger.tag(text_tokens)
 
-                    # ignore relationships between the same entity
-                    if config.tag_type == "simple":
-                        if e1.string == e2.string:
-                            continue
-                    elif config.tag_type == "linked":
-                        if e1.url == e2.url:
-                            continue
+            self.add_relationship(self.sentence, text_tokens, e1_index, e2_index, e1, e2)
 
-                    # run PoS-tagger over the sentence only once
-                    if self.tagged_text is None:
-                        # split text into tokens and tag them using NLTK's
-                        # default English tagger
-                        # POS_TAGGER = 'taggers/maxent_treebank_pos_tagger/
-                        # english.pickle'
-                        self.tagged_text = pos_tagger.tag(text_tokens)
+    def add_relationship(self, sentence, text_tokens, e1_index, e2_index, e1, e2):
+        before = self.tagged_text[:e1_index]
+        before = before[-self.window_size:]
+        between = self.tagged_text[e1_index + len(e1.parts):e2_index]
+        after = self.tagged_text[e2_index+len(e2.parts):]
+        after = after[:self.window_size]
 
-                    before = self.tagged_text[:sorted_keys[i]]
-                    before = before[-window_size:]
-                    between = self.tagged_text[sorted_keys[i] +
-                                               len(e1.parts):sorted_keys[i+1]]
-                    after = self.tagged_text[sorted_keys[i+1]+len(e2.parts):]
-                    after = after[:window_size]
+        # ignore relationships where BET context is only stopwords
+        # or other invalid words
+        if all(x in not_valid for x in
+               text_tokens[e1_index + len(e1.parts):e2_index]):
+            return
 
-                    # ignore relationships where BET context is only stopwords
-                    # or other invalid words
-                    if all(x in not_valid for x in
-                           text_tokens[sorted_keys[i] + len(e1.parts):sorted_keys[i + 1]]):
-                        continue
+        if self.config.tag_type == "simple":
+            r = Relationship(
+                sentence, before, between, after, e1.string,
+                e2.string, e1.type, e2.type
+            )
+            self.relationships.append(r)
 
-                    if config.tag_type == "simple":
-                        r = Relationship(
-                            sentence, before, between, after, e1.string,
-                            e2.string, e1_type, e2.type
-                        )
+        elif self.config.tag_type == "linked":
+            r = Relationship(
+                sentence, before, between, after, e1.url, e2.url,
+                e1.type, e2.type
+            )
+            self.relationships.append(r)
 
-                    elif config.tag_type == "linked":
-                        r = Relationship(
-                            sentence, before, between, after, e1.url, e2.url,
-                            e1.type, e2.type
-                        )
-
-                    self.relationships.append(r)
